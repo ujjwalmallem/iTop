@@ -270,6 +270,172 @@ def cross_checks(itop_class, records):
 
 
 # ---------------------------------------------------------------------------
+# Accuracy: configurable rule engine
+# ---------------------------------------------------------------------------
+# Rules file (JSON): { "Server": [ {rule}, {rule} ], "VirtualMachine": [...] }
+# Supported checks:
+#   not_blank        -> attribute must have a value
+#   allowed_values   -> value must be in "values" list (case-insensitive);
+#                       set "allow_blank": true to tolerate blanks
+#   regex            -> non-blank values must match "pattern"
+#   after            -> attribute (date) must be >= "other" attribute
+#   not_past_if      -> attribute (date) must not be in the past when
+#                       "other" attribute's value is in "values"
+#   max_age_days     -> attribute (date) must be within last N "days"
+
+def load_rules(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def apply_rules(itop_class, records, class_rules):
+    """Returns list of violation dicts with per-record drill-down."""
+    violations = []
+    today = datetime.now().strftime("%Y-%m-%d")
+    for rule in class_rules:
+        attr = rule.get("attribute", "")
+        check = rule.get("check", "")
+        rname = rule.get("name") or f"{attr}: {check}"
+        sev = rule.get("severity", "medium")
+        for r in records:
+            val = scalarize(r.get(attr))
+            sval = "" if is_blank(val) else str(val).strip()
+            bad, detail = False, ""
+
+            if check == "not_blank":
+                bad = is_blank(val)
+                detail = "blank/NULL"
+            elif check == "allowed_values":
+                allowed = {str(v).strip().lower() for v in rule.get("values", [])}
+                if is_blank(val):
+                    bad = not rule.get("allow_blank", False)
+                    detail = "blank/NULL"
+                else:
+                    bad = sval.lower() not in allowed
+                    detail = f"value '{sval}' not in allowed list"
+            elif check == "regex":
+                if not is_blank(val):
+                    bad = not re.match(rule.get("pattern", ".*"), sval)
+                    detail = f"value '{sval}' does not match pattern"
+            elif check == "after":
+                other = scalarize(r.get(rule.get("other", "")))
+                if not is_blank(val) and not is_blank(other):
+                    bad = str(val)[:10] < str(other)[:10]
+                    detail = f"{attr}={val} is before {rule.get('other')}={other}"
+            elif check == "not_past_if":
+                other = str(scalarize(r.get(rule.get("other", ""))) or "").strip().lower()
+                trigger = {str(v).lower() for v in rule.get("values", [])}
+                if not is_blank(val) and other in trigger:
+                    bad = sval[:10] < today
+                    detail = f"{attr}={val} is in the past while {rule.get('other')}='{other}'"
+            elif check == "max_age_days":
+                days = int(rule.get("days", 90))
+                cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+                if not is_blank(val):
+                    bad = sval[:10] < cutoff
+                    detail = f"{attr}={val} older than {days} days"
+
+            if bad:
+                violations.append({
+                    "class": itop_class,
+                    "id": r.get("_id", ""),
+                    "record_name": scalarize(r.get("name", "")) or "",
+                    "rule": rname,
+                    "severity": sev,
+                    "attribute": attr,
+                    "value": sval,
+                    "detail": detail,
+                })
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Accuracy: reconciliation against an authoritative source (CSV)
+# ---------------------------------------------------------------------------
+
+def _norm(v):
+    return str(v or "").strip().lower()
+
+
+def reconcile(itop_class, records, csv_path, match_on, compare_fields):
+    """Compare iTop records with an authoritative CSV export.
+
+    Returns dict with:
+      missing_in_itop  -> keys present in source but absent from iTop
+      ghosts_in_itop   -> keys present in iTop but absent from source
+      mismatches       -> per-field value differences for matched records
+    """
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        src_rows = list(csv.DictReader(f))
+    if not src_rows:
+        raise ValueError(f"{csv_path} is empty")
+    if match_on not in src_rows[0]:
+        raise ValueError(f"Column '{match_on}' not found in {csv_path} "
+                         f"(columns: {', '.join(src_rows[0].keys())})")
+
+    src = {_norm(row.get(match_on)): row for row in src_rows
+           if _norm(row.get(match_on))}
+    itop = {_norm(r.get(match_on)): r for r in records
+            if not is_blank(r.get(match_on))}
+
+    missing = sorted(set(src) - set(itop))
+    ghosts = sorted(set(itop) - set(src))
+
+    mismatches = []
+    for key in set(src) & set(itop):
+        for field in compare_fields:
+            sv, iv = _norm(src[key].get(field)), _norm(scalarize(itop[key].get(field)))
+            if sv != iv:
+                mismatches.append({
+                    "class": itop_class,
+                    "key": key,
+                    "id": itop[key].get("_id", ""),
+                    "field": field,
+                    "itop_value": scalarize(itop[key].get(field)),
+                    "source_value": src[key].get(field, ""),
+                })
+
+    matched = len(set(src) & set(itop))
+    accuracy_pct = round(100.0 * (matched * len(compare_fields) - len(mismatches))
+                         / (matched * len(compare_fields)), 1) if matched and compare_fields else None
+    return {
+        "class": itop_class,
+        "source": os.path.basename(csv_path),
+        "source_total": len(src),
+        "itop_total": len(itop),
+        "matched": matched,
+        "missing_in_itop": missing,
+        "ghosts_in_itop": ghosts,
+        "mismatches": mismatches,
+        "accuracy_pct": accuracy_pct,
+    }
+
+
+def write_violations_csv(path, violations):
+    fields = ["class", "id", "record_name", "rule", "severity",
+              "attribute", "value", "detail"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(violations)
+
+
+def write_reconciliation_csv(path, recon_results):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["class", "issue_type", "key", "itop_id", "field",
+                    "itop_value", "source_value"])
+        for rec in recon_results:
+            for k in rec["missing_in_itop"]:
+                w.writerow([rec["class"], "missing_in_itop", k, "", "", "", ""])
+            for k in rec["ghosts_in_itop"]:
+                w.writerow([rec["class"], "ghost_in_itop", k, "", "", "", ""])
+            for m in rec["mismatches"]:
+                w.writerow([rec["class"], "value_mismatch", m["key"], m["id"],
+                            m["field"], m["itop_value"], m["source_value"]])
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -282,7 +448,11 @@ def write_summary_csv(path, rows):
         w.writerows(rows)
 
 
-def write_html_report(path, rows, all_issues, class_totals):
+def write_html_report(path, rows, all_issues, class_totals,
+                      violations=None, recon_results=None):
+    violations = violations or []
+    recon_results = recon_results or []
+
     def esc(x):
         return html.escape(str(x))
 
@@ -321,6 +491,54 @@ def write_html_report(path, rows, all_issues, class_totals):
         parts.append("</table>")
     else:
         parts.append("<p>None found.</p>")
+
+    # ---- Accuracy: rule violations (drill-down) ----
+    if violations:
+        by_rule = {}
+        for v in violations:
+            by_rule.setdefault((v["class"], v["rule"], v["severity"]), []).append(v)
+        parts.append(f"<h2>Accuracy rule violations "
+                     f"({len(violations)} records, drill-down in violations.csv)</h2>")
+        parts.append("<table><tr><th>Class</th><th>Rule</th><th>Severity</th>"
+                     "<th>Count</th><th>Sample records (id: name = value)</th></tr>")
+        for (cls_, rule, sev), items in sorted(by_rule.items(),
+                                               key=lambda kv: -len(kv[1])):
+            sample = "; ".join(
+                f"{i['id']}: {i['record_name'] or '?'} = '{i['value']}'"
+                for i in items[:8])
+            row_cls = "bad" if sev == "high" else "warn"
+            parts.append(f"<tr class='{row_cls}'><td>{esc(cls_)}</td>"
+                         f"<td>{esc(rule)}</td><td>{esc(sev)}</td>"
+                         f"<td>{len(items)}</td><td>{esc(sample)}</td></tr>")
+        parts.append("</table>")
+
+    # ---- Accuracy: reconciliation vs authoritative source ----
+    for rec in recon_results:
+        acc = f" &middot; field accuracy {rec['accuracy_pct']}%" \
+            if rec["accuracy_pct"] is not None else ""
+        parts.append(f"<h2>Reconciliation: {esc(rec['class'])} vs "
+                     f"{esc(rec['source'])}</h2>")
+        parts.append(f"<p>Source: {rec['source_total']} &middot; "
+                     f"iTop: {rec['itop_total']} &middot; "
+                     f"matched: {rec['matched']} &middot; "
+                     f"<b>missing in iTop: {len(rec['missing_in_itop'])}</b> &middot; "
+                     f"<b>ghosts in iTop: {len(rec['ghosts_in_itop'])}</b> &middot; "
+                     f"value mismatches: {len(rec['mismatches'])}{acc}</p>")
+        if rec["missing_in_itop"]:
+            parts.append("<p class='flags'>Missing in iTop (exists in source): "
+                         + esc(", ".join(rec["missing_in_itop"][:30])) + "</p>")
+        if rec["ghosts_in_itop"]:
+            parts.append("<p class='flags'>Ghosts in iTop (not in source): "
+                         + esc(", ".join(rec["ghosts_in_itop"][:30])) + "</p>")
+        if rec["mismatches"]:
+            parts.append("<table><tr><th>Key</th><th>iTop ID</th><th>Field</th>"
+                         "<th>iTop value</th><th>Source value</th></tr>")
+            for m in rec["mismatches"][:100]:
+                parts.append(f"<tr class='warn'><td>{esc(m['key'])}</td>"
+                             f"<td>{esc(m['id'])}</td><td>{esc(m['field'])}</td>"
+                             f"<td>{esc(m['itop_value'])}</td>"
+                             f"<td>{esc(m['source_value'])}</td></tr>")
+            parts.append("</table>")
 
     parts.append("<h2>Attributes with quality flags (worst first)</h2>")
     parts.append("<table><tr><th>Class</th><th>Attribute</th><th>Type</th>"
@@ -379,6 +597,17 @@ def main():
                     help="Skip TLS certificate verification (self-signed certs)")
     ap.add_argument("--dump-raw", action="store_true",
                     help="Also dump raw records per class to CSV")
+    ap.add_argument("--rules",
+                    help="JSON rules file for accuracy checks (see example_rules.json)")
+    ap.add_argument("--reconcile", action="append", default=[],
+                    metavar="Class=source.csv",
+                    help="Reconcile a class against an authoritative CSV export "
+                         "(repeatable), e.g. --reconcile Server=aws_inventory.csv")
+    ap.add_argument("--match-on", default="name",
+                    help="Key column used to match iTop records to source rows")
+    ap.add_argument("--compare", default="",
+                    help="Comma-separated fields to compare during reconciliation, "
+                         "e.g. managementip,osfamily,brand")
     ap.add_argument("--out", default="itop_profile_output")
     args = ap.parse_args()
 
@@ -386,11 +615,25 @@ def main():
         ap.error("Provide --url/--user/--pwd or set ITOP_URL/ITOP_USER/ITOP_PWD")
 
     os.makedirs(args.out, exist_ok=True)
+    if args.no_verify_ssl:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     client = ITopClient(args.url, args.user, args.pwd,
                         api_version=args.api_version,
                         verify_ssl=not args.no_verify_ssl)
 
+    rules = load_rules(args.rules) if args.rules else {}
+    recon_specs = {}
+    for spec in args.reconcile:
+        if "=" not in spec:
+            ap.error(f"--reconcile expects Class=path.csv, got: {spec}")
+        cls_, path_ = spec.split("=", 1)
+        recon_specs[cls_.strip()] = path_.strip()
+    compare_fields = [f.strip() for f in args.compare.split(",") if f.strip()]
+
     all_rows, all_issues, class_totals = [], [], {}
+    all_violations, recon_results = [], []
 
     for itop_class in [c.strip() for c in args.classes.split(",") if c.strip()]:
         print(f"[*] Fetching {itop_class} ...", flush=True)
@@ -412,6 +655,22 @@ def main():
 
         all_issues.extend(cross_checks(itop_class, records))
 
+        if itop_class in rules:
+            v = apply_rules(itop_class, records, rules[itop_class])
+            print(f"    -> {len(v)} rule violation(s)")
+            all_violations.extend(v)
+
+        if itop_class in recon_specs:
+            try:
+                rec = reconcile(itop_class, records, recon_specs[itop_class],
+                                args.match_on, compare_fields)
+                recon_results.append(rec)
+                print(f"    -> reconciliation: {len(rec['missing_in_itop'])} missing, "
+                      f"{len(rec['ghosts_in_itop'])} ghosts, "
+                      f"{len(rec['mismatches'])} mismatches")
+            except Exception as e:
+                print(f"    !! Reconciliation failed for {itop_class}: {e}")
+
         if args.dump_raw:
             dump_raw_csv(os.path.join(args.out, f"{itop_class}_records.csv"), records)
 
@@ -419,12 +678,22 @@ def main():
         sys.exit("No data profiled — check credentials/classes.")
 
     write_summary_csv(os.path.join(args.out, "summary.csv"), all_rows)
+    if all_violations:
+        write_violations_csv(os.path.join(args.out, "violations.csv"), all_violations)
+    if recon_results:
+        write_reconciliation_csv(os.path.join(args.out, "reconciliation.csv"),
+                                 recon_results)
     write_html_report(os.path.join(args.out, "profile_report.html"),
-                      all_rows, all_issues, class_totals)
+                      all_rows, all_issues, class_totals,
+                      violations=all_violations, recon_results=recon_results)
 
     n_flagged = sum(1 for r in all_rows if r["flag_count"])
     print(f"\n[OK] Profiled {len(all_rows)} attributes across {len(class_totals)} classes")
     print(f"     {n_flagged} attributes flagged, {len(all_issues)} cross-attribute issues")
+    if all_violations:
+        print(f"     {len(all_violations)} accuracy rule violations -> violations.csv")
+    if recon_results:
+        print(f"     {len(recon_results)} reconciliation report(s) -> reconciliation.csv")
     print(f"     Report: {os.path.join(args.out, 'profile_report.html')}")
 
 
