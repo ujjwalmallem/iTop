@@ -1,0 +1,73 @@
+{
+  "Server": [
+    {
+      "name": "Status must never be blank (the query bug that started this)",
+      "attribute": "status",
+      "check": "not_blank",
+      "severity": "high"
+    },
+    {
+      "name": "Status must be a valid lifecycle value",
+      "attribute": "status",
+      "check": "allowed_values",
+      "values": ["production", "implementation", "stock", "obsolete"],
+      "severity": "high"
+    },
+    {
+      "name": "Cert start date required",
+      "attribute": "start_date",
+      "check": "not_blank",
+      "severity": "medium"
+    },
+    {
+      "name": "Cert end date required",
+      "attribute": "end_date",
+      "check": "not_blank",
+      "severity": "medium"
+    },
+    {
+      "name": "Cert end date must be after start date",
+      "attribute": "end_date",
+      "check": "after",
+      "other": "start_date",
+      "severity": "high"
+    },
+    {
+      "name": "Cert must not be expired while server is active",
+      "attribute": "end_date",
+      "check": "not_past_if",
+      "other": "status",
+      "values": ["production", "implementation"],
+      "severity": "high"
+    },
+    {
+      "name": "Management IP must be a valid IPv4 address",
+      "attribute": "managementip",
+      "check": "regex",
+      "pattern": "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$",
+      "severity": "medium"
+    },
+    {
+      "name": "Record must have been updated in the last 180 days",
+      "attribute": "last_update",
+      "check": "max_age_days",
+      "days": 180,
+      "severity": "low"
+    }
+  ],
+  "VirtualMachine": [
+    {
+      "name": "Status must never be blank",
+      "attribute": "status",
+      "check": "not_blank",
+      "severity": "high"
+    },
+    {
+      "name": "Status must be a valid lifecycle value",
+      "attribute": "status",
+      "check": "allowed_values",
+      "values": ["production", "implementation", "stock", "obsolete"],
+      "severity": "high"
+    }
+  ]
+}
